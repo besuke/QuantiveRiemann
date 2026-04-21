@@ -1,0 +1,28 @@
+
+Package: QuantiveRiemann
+Type: Package
+Title: Quantitative Finance Utilities Built Around QuantLib
+Version: 0.1.0
+Authors@R: 
+    person(
+      given = "Eiichi",
+      family = "Horigome",
+      role = c("aut", "cre"),
+    )
+Description: Utilities for yield-curve generation, market-data normalization,
+    fixings handling, and quantitative finance workflows built around QuantLib.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
+Depends: 
+    R (>= 4.2.0)
+Imports:
+    dplyr,
+    purrr,
+    tibble,
+    QuantLib
+Suggests:
+    testthat (>= 3.0.0),
+    devtools
+Config/testthat/edition: 3

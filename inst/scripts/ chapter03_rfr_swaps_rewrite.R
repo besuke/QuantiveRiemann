@@ -1,0 +1,660 @@
+# ============================================================
+# chapter03_rfr_swaps_multicurve_rewrite.R
+# ------------------------------------------------------------
+# 第3章 RFRスワップとマルチカーブ
+# Python / QuantLib notebook を、
+# 「QuantLib_tidy + QuantLib(SWIG for R)」前提で書き直した版。
+#
+# 内容:
+# 1. TONA OIS curve
+# 2. shifted TONA curve (+5%)
+# 3. JPY short OIS valuation
+# 4. daily forward decomposition
+# 5. fixing 登録後の再評価
+# 6. SOFR OIS curve / valuation
+# 7. Term SOFR basis curve skeleton
+# 8. two-curve example (forecast vs discount)
+#
+# 前提:
+# - devtools::load_all(.) 済み、または package install 済み
+# - qlr_ir_build_ois_curve_envs(), qlr_trade_ois_swap(), qlr_swap_* が使える
+# - QuantLib SWIG build は OIS / Tibor / SOFR helper が利用可能
+# ============================================================
+
+# ------------------------------------------------------------
+# 0. helpers
+# ------------------------------------------------------------
+.libPaths()
+.libPaths(c(
+  "/Library/Frameworks/R.framework/Versions/4.5-arm64/Resources/library",
+  .libPaths()
+))
+.libPaths()
+library(QuantLib)
+
+library(QuantLib)
+devtools::load_all(".")
+
+parse_tenor <- function(x) {
+  x <- trimws(as.character(x))
+  unit <- tolower(substring(x, nchar(x), nchar(x)))
+  n <- as.integer(substring(x, 1, nchar(x) - 1))
+
+  switch(unit,
+         d = qlr_period_days(n),
+         w = qlr_period_weeks(n),
+         m = qlr_period_months(n),
+         y = qlr_period_years(n),
+         stop("Unsupported tenor: ", x)
+  )
+}
+simple_quote_handle <- function(value) QuoteHandle(SimpleQuote(value))
+
+curve_tbl <- function(curve_obj, n = 200, extrapolate = TRUE) {
+  if (extrapolate) {
+    TermStructure_enableExtrapolation(curve_obj)
+  }
+
+  ref_date_r <- as.Date(qlr_iso(curve_obj$referenceDate()))
+  max_t <- curve_obj$maxTime()
+  times <- seq(0, max_t, length.out = n)
+
+  tibble(time = times) |>
+    mutate(
+      discount = purrr::map_dbl(time, ~ curve_obj$discount(.x)),
+      zero = if_else(time > 0, -log(discount) / time, 0),
+      curve_date = ref_date_r + round(time * 365)
+    )
+}
+
+# coupon-level cashflow access helper
+leg_cashflow_at <- function(leg_obj, i_one_based) {
+  idx0 <- as.integer(i_one_based - 1)
+
+  out <- tryCatch(leg_obj$get(idx0), error = function(e) NULL)
+  if (!is.null(out)) {
+    return(out)
+  }
+
+  out <- tryCatch(Leg___getitem__(leg_obj, idx0), error = function(e) NULL)
+  if (!is.null(out)) {
+    return(out)
+  }
+
+  out <- tryCatch(leg_obj[[i_one_based]][[1]], error = function(e) NULL)
+  if (!is.null(out)) {
+    return(out)
+  }
+
+  stop("Unable to access leg cashflow at index ", i_one_based)
+}
+
+make_business_dates_tbl <- function(start_date, end_date, calendar_obj) {
+  start_r <- as.Date(start_date)
+  end_r <- as.Date(end_date)
+
+  seq.Date(start_r, end_r - 1, by = "day") |>
+    tibble(accrual_date = _) |>
+    mutate(
+      accrual_date_chr = as.character(accrual_date),
+      is_business_day = purrr::map_lgl(
+        accrual_date_chr,
+        ~ !Calendar_isHoliday(calendar_obj, qlr_date(.x))
+      )
+    ) |>
+    filter(is_business_day) |>
+    transmute(accrual_date = accrual_date_chr)
+}
+
+# ------------------------------------------------------------
+# 1. TONA OIS curve via package-style quotes
+# ------------------------------------------------------------
+
+trade_date_tona <- "2022-08-19"
+qlr_set_eval_date(trade_date_tona)
+
+tona_quotes <- tibble::tribble(
+  ~as_of_date, ~currency, ~instrument, ~kind, ~tenor, ~rate,
+  as.Date(trade_date_tona), "JPY", "TONA", "depo", "1D", -0.00009,
+  as.Date(trade_date_tona), "JPY", "TONA", "ois", "1W", -0.0001261,
+  as.Date(trade_date_tona), "JPY", "TONA", "ois", "2W", -0.0001469,
+  as.Date(trade_date_tona), "JPY", "TONA", "ois", "1M", -0.0001807,
+  as.Date(trade_date_tona), "JPY", "TONA", "ois", "3M", -0.0001919,
+  as.Date(trade_date_tona), "JPY", "TONA", "ois", "6M", -0.0001043,
+  as.Date(trade_date_tona), "JPY", "TONA", "ois", "9M", 0.0000022,
+  as.Date(trade_date_tona), "JPY", "TONA", "ois", "12M", 0.0001250,
+  as.Date(trade_date_tona), "JPY", "TONA", "ois", "18M", 0.0003125,
+  as.Date(trade_date_tona), "JPY", "TONA", "ois", "2Y", 0.0004875,
+  as.Date(trade_date_tona), "JPY", "TONA", "ois", "3Y", 0.0007375,
+  as.Date(trade_date_tona), "JPY", "TONA", "ois", "4Y", 0.0009479,
+  as.Date(trade_date_tona), "JPY", "TONA", "ois", "5Y", 0.0011854,
+  as.Date(trade_date_tona), "JPY", "TONA", "ois", "7Y", 0.0019146
+)
+
+qlr_show_tbl(tona_quotes, "TONA market quotes", n = 20)
+
+tona_curve_envs <- qlr_ir_build_ois_curve_envs(
+  quotes = tona_quotes,
+  trade_date = trade_date_tona,
+  verbose = TRUE
+)
+
+tona_curve_env <- tona_curve_envs[["JPY::TONA"]]
+tona_curve <- tona_curve_env$curve
+
+qlr_show_tbl(
+  curve_tbl(tona_curve) |>
+    transmute(date = curve_date, tonaDF = discount, zeroRT = zero),
+  "TONA curve table",
+  n = 12
+)
+
+qlr_show_tbl(
+  tibble(
+    reference_date = qlr_iso(tona_curve$referenceDate()),
+    discount_2022_08_23 = tona_curve$discount(qlr_date("2022-08-23"))
+  ),
+  "TONA curve quick checks",
+  n = 20
+)
+
+# ------------------------------------------------------------
+# 2. TONA +5% shifted curve
+# ------------------------------------------------------------
+
+make_zero_spreaded_curve <- function(base_curve_handle, spread_rate, day_count_obj = Actual365Fixed()) {
+  out <- ZeroSpreadedTermStructure(
+    base_curve_handle,
+    simple_quote_handle(spread_rate),
+    Compounding_Simple_get(),
+    Frequency_Annual_get(),
+    day_count_obj
+  )
+  TermStructure_enableExtrapolation(out)
+  out
+}
+
+tona_shift_curve <- make_zero_spreaded_curve(
+  base_curve_handle = tona_curve_env$curve_handle,
+  spread_rate = 0.05,
+  day_count_obj = Actual365Fixed()
+)
+
+tona_shift_curve_handle <- YieldTermStructureHandle(tona_shift_curve)
+tona_shift_index <- OvernightIndex(
+  "TONA",
+  0,
+  JPYCurrency(),
+  Japan(),
+  Actual365Fixed(),
+  tona_shift_curve_handle
+)
+
+qlr_show_tbl(
+  curve_tbl(tona_shift_curve) |>
+    transmute(date = curve_date, shftRT = zero, DF = discount),
+  "Shifted TONA curve (+5%)",
+  n = 12
+)
+
+# use shifted curve for pedagogical cashflow visibility
+pedagogical_tona_curve <- tona_shift_curve
+pedagogical_tona_handle <- tona_shift_curve_handle
+pedagogical_tona_index <- tona_shift_index
+
+# ------------------------------------------------------------
+# 3. Short JPY OIS valuation
+# ------------------------------------------------------------
+jpy_ois_short <- qlr_trade_ois_swap_py(
+  curve_env = list(
+    curve = pedagogical_tona_curve,
+    curve_handle = pedagogical_tona_handle,
+    index = pedagogical_tona_index,
+    currency = "JPY",
+    instrument = "TONA"
+  ),
+  effective = "2022-08-23",
+  maturity = "2022-08-30",
+  notional = 10000000,
+  fixed_rate = 0.05,
+  pay_receive = "pay",
+  verbose = TRUE
+)
+
+qlr_ir_show_swap_summary(
+  trade_env = jpy_ois_short,
+  title = "JPY short OIS summary"
+)
+
+jpy_ois_fixed_cf_tbl <- qlr_swap_fixed_leg_table(
+  jpy_ois_short$swap,
+  pedagogical_tona_curve
+)
+
+jpy_ois_float_cf_tbl <- qlr_swap_float_leg_table(
+  jpy_ois_short$swap,
+  pedagogical_tona_curve
+)
+
+qlr_show_tbl(jpy_ois_fixed_cf_tbl, "TONA fixed leg cashflows", n = 10)
+qlr_show_tbl(jpy_ois_float_cf_tbl, "TONA floating leg cashflows", n = 10)
+
+# fair-rate check
+jpy_eff_df <- pedagogical_tona_curve$discount(qlr_date("2022-08-23"))
+jpy_mat_df <- pedagogical_tona_curve$discount(qlr_date("2022-08-30"))
+jpy_annuity <- (7 / 365) * pedagogical_tona_curve$discount(qlr_date("2022-09-01"))
+jpy_swap_rate_hc <- (jpy_eff_df - jpy_mat_df) / jpy_annuity
+
+qlr_show_tbl(
+  tibble(
+    effDF = jpy_eff_df,
+    matDF = jpy_mat_df,
+    annuity = jpy_annuity,
+    swapRT = jpy_swap_rate_hc
+  ),
+  "TONA fair-rate hand check",
+  n = 20
+)
+
+# ------------------------------------------------------------
+# 4. Daily decomposition of short OIS floating leg
+# ------------------------------------------------------------
+jpy_ois_daily <- qlr_trade_ois_swap_py(
+  curve_env = list(
+    curve = pedagogical_tona_curve,
+    curve_handle = pedagogical_tona_handle,
+    index = pedagogical_tona_index,
+    currency = "JPY",
+    instrument = "TONA"
+  ),
+  effective = "2022-08-23",
+  maturity = "2022-08-30",
+  notional = 10000000,
+  fixed_rate = 0.05,
+  pay_receive = "pay",
+  fixed_schedule_tenor = "1Y",
+  floating_schedule_tenor = "1D",
+  pay_lag = 0,
+  verbose = TRUE
+)
+
+jpy_ois_daily <- qlr_trade_ois_swap_py(
+  curve_env = list(
+    curve = pedagogical_tona_curve,
+    curve_handle = pedagogical_tona_handle,
+    index = pedagogical_tona_index,
+    currency = "JPY",
+    instrument = "TONA"
+  ),
+  effective = "2022-08-23",
+  maturity = "2022-08-30",
+  notional = 10000000,
+  fixed_rate = 0.05,
+  pay_receive = "pay",
+  fixed_schedule_tenor = "1Y",
+  floating_schedule_tenor = "1D",
+  pay_lag = 0,
+  verbose = TRUE
+)
+
+
+qlr_set_eval_date("2022-08-19")
+jpy_daily_float_cf_tbl <- qlr_ois_daily_forward_table(
+  swap = jpy_ois_daily$swap,
+  curve = pedagogical_tona_curve,
+  index = jpy_ois_daily$index,
+  eval_date = "2022-08-19",
+  notional = 10000000
+)
+
+qlr_show_tbl(jpy_daily_float_cf_tbl, "TONA daily forward leg", n = 20)
+
+if (nrow(jpy_daily_float_cf_tbl) >= 6) {
+  aug29_fwd <- (jpy_daily_float_cf_tbl$discount_factor[5] / jpy_daily_float_cf_tbl$discount_factor[6] - 1) * 365
+  cat("TONA rate (Aug29):", sprintf("%.6f%%", 100 * aug29_fwd), "\n")
+}
+
+if (nrow(jpy_daily_float_cf_tbl) >= 6) {
+  dly_cmp <- (1 + jpy_daily_float_cf_tbl$days[-1] / 365 * jpy_daily_float_cf_tbl$rate[-1]) |>
+    prod() - 1
+  cat(
+    "Future value:", sprintf("%,.4f", dly_cmp * 10000000),
+    " fair rate:", sprintf("%.6f%%", 100 * dly_cmp * 365 / 7),
+    "\n"
+  )
+}
+
+# ------------------------------------------------------------
+# 5. Fixings and revaluation (2022-08-25)
+# ------------------------------------------------------------
+
+jpy_fixings_tbl <- tibble::tribble(
+  ~date, ~currency, ~instrument, ~fixing,
+  "2022-08-23", "JPY", "TONA", 0.051,
+  "2022-08-24", "JPY", "TONA", 0.052
+)
+
+jpy_float_before_tbl <- qlr_swap_float_leg_table(
+  jpy_ois_short$swap,
+  pedagogical_tona_curve
+)
+
+qlr_ir_apply_fixings(
+  index_obj = jpy_ois_short$index,
+  fixings_tbl = jpy_fixings_tbl,
+  currency = "JPY",
+  instrument = "TONA"
+)
+
+qlr_set_eval_date("2022-08-25")
+
+jpy_float_after_tbl <- qlr_swap_float_leg_table(
+  jpy_ois_short$swap,
+  pedagogical_tona_curve
+)
+
+qlr_ir_show_fixing_before_after(
+  before_tbl = jpy_float_before_tbl,
+  after_tbl = jpy_float_after_tbl,
+  title = "TONA fixing before / after",
+  n = 10
+)
+
+qlr_ir_show_swap_summary(
+  trade_env = jpy_ois_short,
+  title = "TONA short OIS summary after fixings"
+)
+
+jpy_fixing_diag_tbl <- qlr_ir_fixing_table(
+  swap = jpy_ois_daily$swap,
+  curve = pedagogical_tona_curve,
+  index = jpy_ois_short$index
+)
+
+qlr_show_tbl(jpy_fixing_diag_tbl, "TONA daily fixing decomposition", n = 20)
+
+# ------------------------------------------------------------
+# 6. SOFR OIS curve and swap
+# ------------------------------------------------------------
+
+trade_date_sofr <- "2023-09-26"
+qlr_set_eval_date(trade_date_sofr)
+
+sofr_quotes <- tibble::tribble(
+  ~as_of_date, ~currency, ~instrument, ~kind, ~tenor, ~rate,
+  as.Date(trade_date_sofr), "USD", "SOFR", "depo", "1D", 0.0531,
+  as.Date(trade_date_sofr), "USD", "SOFR", "ois", "1M", 0.0532,
+  as.Date(trade_date_sofr), "USD", "SOFR", "ois", "3M", 0.0538,
+  as.Date(trade_date_sofr), "USD", "SOFR", "ois", "6M", 0.0546,
+  as.Date(trade_date_sofr), "USD", "SOFR", "ois", "1Y", 0.0545,
+  as.Date(trade_date_sofr), "USD", "SOFR", "ois", "2Y", 0.0501,
+  as.Date(trade_date_sofr), "USD", "SOFR", "ois", "3Y", 0.0467
+)
+
+sofr_curve_envs <- qlr_ir_build_ois_curve_envs(
+  quotes = sofr_quotes,
+  trade_date = trade_date_sofr,
+  verbose = TRUE
+)
+
+sofr_curve_env <- sofr_curve_envs[["USD::SOFR"]]
+sofr_curve <- sofr_curve_env$curve
+
+qlr_show_tbl(curve_tbl(sofr_curve), "SOFR curve table", n = 12)
+
+
+sofr_ois_trade <- qlr_trade_ois_swap_py(
+  curve_env = sofr_curve_env,
+  effective = "2023-09-28",
+  maturity = "2025-09-28",
+  notional = 10000000,
+  fixed_rate = 0.05,
+  pay_receive = "pay",
+  verbose = TRUE
+)
+
+qlr_ir_show_swap_summary(
+  trade_env = sofr_ois_trade,
+  title = "SOFR OIS summary"
+)
+
+sofr_float_cf_tbl <- qlr_swap_float_leg_table(
+  sofr_ois_trade$swap,
+  sofr_curve_env$curve
+)
+qlr_show_tbl(sofr_float_cf_tbl, "SOFR floating leg cashflows", n = 20)
+
+if (nrow(sofr_float_cf_tbl) >= 2) {
+  eff_df <- sofr_curve_env$curve$discount(qlr_date(sofr_float_cf_tbl$accrual_end[1]))
+  mat_df <- sofr_curve_env$curve$discount(qlr_date(sofr_float_cf_tbl$accrual_end[2]))
+  annuity <- (364 / 360) * mat_df
+  fwd_swap_rate <- (eff_df - mat_df) / annuity
+  cat("Forward swap rate:", sprintf("%.6f%%", 100 * fwd_swap_rate), "\n")
+}
+
+# ------------------------------------------------------------
+# 7. Term SOFR basis curve skeleton
+# ------------------------------------------------------------
+
+make_term_sofr_basis_curve <- function(sofr_curve_env,
+                                       term_sofr_3m_rate = 0.0538558,
+                                       basis_quotes = tibble::tribble(
+                                         ~tenor, ~basis,
+                                         "6M", 0,
+                                         "1Y", 0,
+                                         "2Y", 0,
+                                         "3Y", 0
+                                       )) {
+  qlr_set_eval_date("2023-09-26")
+
+  term_curve_handle <- RelinkableYieldTermStructureHandle()
+  term_index <- IborIndex(
+    "TermSofr",
+    qlr_period_months(3),
+    2,
+    USDCurrency(),
+    Sofr()$fixingCalendar(),
+    "ModifiedFollowing",
+    TRUE,
+    Actual360(),
+    term_curve_handle
+  )
+
+  helper_list <- list(
+    DepositRateHelper(
+      simple_quote_handle(term_sofr_3m_rate),
+      term_index
+    )
+  )
+
+  basis_helpers <- purrr::map(seq_len(nrow(basis_quotes)), function(i) {
+    tenor_i <- basis_quotes$tenor[i]
+    basis_i <- basis_quotes$basis[i]
+
+    OvernightIborBasisSwapRateHelper(
+      simple_quote_handle(basis_i),
+      parse_tenor(tolower(tenor_i)),
+      2,
+      Sofr()$fixingCalendar(),
+      "ModifiedFollowing",
+      FALSE,
+      sofr_curve_env$index,
+      term_index,
+      sofr_curve_env$curve_handle
+    )
+  })
+
+  helper_vec <- RateHelperVector()
+  purrr::walk(c(helper_list, basis_helpers), ~ RateHelperVector_append(helper_vec, .x))
+
+  term_curve <- PiecewiseLogLinearDiscount(
+    2,
+    Sofr()$fixingCalendar(),
+    helper_vec,
+    Actual360()
+  )
+  TermStructure_enableExtrapolation(term_curve)
+  RelinkableYieldTermStructureHandle_linkTo(term_curve_handle, term_curve)
+
+  list(
+    index = term_index,
+    curve = term_curve,
+    curve_handle = term_curve_handle
+  )
+}
+
+term_sofr_bundle <- tryCatch(
+  make_term_sofr_basis_curve(sofr_curve_env),
+  error = function(e) NULL
+)
+
+if (is.null(term_sofr_bundle)) {
+  qlr_show_tbl(
+    tibble(note = "Term SOFR basis helper depends on SWIG build; skipped"),
+    "Term SOFR basis curve"
+  )
+} else {
+  qlr_show_tbl(curve_tbl(term_sofr_bundle$curve), "Term SOFR basis curve", n = 12)
+}
+
+# ------------------------------------------------------------
+# 8. Two-curve example (forecast vs discount)
+# ------------------------------------------------------------
+
+qlr_set_eval_date("2021-08-02")
+
+jp_calendar <- Japan()
+dc_a365 <- Actual365Fixed()
+freq_annual <- Frequency_Annual_get()
+
+build_rate_helper_vector <- function(helper_list) {
+  helper_vec <- RateHelperVector()
+  purrr::walk(helper_list, ~ RateHelperVector_append(helper_vec, .x))
+  helper_vec
+}
+
+# single / forecast-like curve
+s_curve_handle <- RelinkableYieldTermStructureHandle()
+rt_1y <- 0.07
+rt_2y <- 0.13
+ix_1y_single <- Tibor(qlr_period_years(1), s_curve_handle)
+
+s_helpers <- list(
+  DepositRateHelper(rt_1y, ix_1y_single),
+  SwapRateHelper(rt_2y, qlr_period_years(2), jp_calendar, freq_annual, "ModifiedFollowing", dc_a365, ix_1y_single)
+)
+
+s_curve <- PiecewiseLogLinearDiscount(2, jp_calendar, build_rate_helper_vector(s_helpers), dc_a365)
+RelinkableYieldTermStructureHandle_linkTo(s_curve_handle, s_curve)
+TermStructure_enableExtrapolation(s_curve)
+
+qlr_show_tbl(curve_tbl(s_curve), "Single/forecast curve", n = 10)
+
+single_swap_bundle <- make_vanilla_swap_safe(
+  index_obj = ix_1y_single,
+  effective_date = "2021-08-04",
+  maturity_date = "2023-08-04",
+  fixed_rate = rt_2y,
+  nominal = 10000000,
+  swap_type = Swap_Payer_get(),
+  calendar_obj = jp_calendar,
+  fixed_tenor = qlr_period_years(1),
+  float_tenor = qlr_period_years(1),
+  fixed_day_count = dc_a365,
+  float_day_count = dc_a365
+)
+
+single_swap <- single_swap_bundle$swap
+Instrument_setPricingEngine(single_swap, DiscountingSwapEngine(s_curve_handle))
+
+qlr_show_tbl(
+  tibble(npv_single_curve = single_swap$NPV()),
+  "Single-curve valuation",
+  n = 20
+)
+
+# discount curve
+d_curve_handle <- RelinkableYieldTermStructureHandle()
+d_rt_1y <- 0.05
+d_rt_2y <- 0.08
+ix_1y_discount <- Tibor(qlr_period_years(1), d_curve_handle)
+
+d_helpers <- list(
+  DepositRateHelper(d_rt_1y, ix_1y_discount),
+  SwapRateHelper(d_rt_2y, qlr_period_years(2), jp_calendar, freq_annual, "ModifiedFollowing", dc_a365, ix_1y_discount)
+)
+
+d_curve <- PiecewiseLogLinearDiscount(2, jp_calendar, build_rate_helper_vector(d_helpers), dc_a365)
+RelinkableYieldTermStructureHandle_linkTo(d_curve_handle, d_curve)
+TermStructure_enableExtrapolation(d_curve)
+
+qlr_show_tbl(curve_tbl(d_curve), "Discount curve", n = 10)
+
+# forwarding curve with discounting handle injected in swap helper
+f_curve_handle <- RelinkableYieldTermStructureHandle()
+ix_1y_forward <- Tibor(qlr_period_years(1), f_curve_handle)
+
+
+f_helpers <- list(
+  DepositRateHelper(rt_1y, ix_1y_forward),
+  SwapRateHelper(
+    rt_2y,
+    qlr_period_years(2),
+    jp_calendar,
+    freq_annual,
+    "ModifiedFollowing",
+    dc_a365,
+    ix_1y_forward,
+    simple_quote_handle(0),
+    qlr_period_days(0),
+    d_curve_handle
+  )
+)
+
+f_curve <- PiecewiseLogLinearDiscount(2, jp_calendar, build_rate_helper_vector(f_helpers), dc_a365)
+RelinkableYieldTermStructureHandle_linkTo(f_curve_handle, f_curve)
+TermStructure_enableExtrapolation(f_curve)
+
+qlr_show_tbl(curve_tbl(f_curve), "Forward curve", n = 10)
+
+fwd_dt_1 <- qlr_date("2022-08-04")
+fwd_dt_2 <- qlr_date("2023-08-04")
+fwd_ix_1x2 <- f_curve$forwardRate(fwd_dt_1, fwd_dt_2, dc_a365, Compounding_Simple_get())
+
+qlr_show_tbl(
+  tibble(
+    forward_1x2 = fwd_ix_1x2$rate()
+  ),
+  "Two-curve 1x2 forward rate",
+  n = 20
+)
+
+two_curve_swap_bundle <- make_vanilla_swap_safe(
+  index_obj = ix_1y_forward,
+  effective_date = "2021-08-04",
+  maturity_date = "2023-08-04",
+  fixed_rate = rt_2y,
+  nominal = 10000000,
+  swap_type = Swap_Payer_get(),
+  calendar_obj = jp_calendar,
+  fixed_tenor = qlr_period_years(1),
+  float_tenor = qlr_period_years(1),
+  fixed_day_count = dc_a365,
+  float_day_count = dc_a365
+)
+
+two_curve_swap <- two_curve_swap_bundle$swap
+Instrument_setPricingEngine(two_curve_swap, DiscountingSwapEngine(d_curve_handle))
+
+qlr_show_tbl(
+  tibble(
+    npv_two_curve = two_curve_swap$NPV(),
+    fixed_leg_npv = two_curve_swap$legNPV(0),
+    float_leg_npv = two_curve_swap$legNPV(1)
+  ),
+  "Two-curve valuation",
+  n = 20
+)
+
+cat("\nchapter03 rewrite completed successfully.\n")
+

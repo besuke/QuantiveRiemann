@@ -1,0 +1,13 @@
+.DS_Store
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+library/
+renv/library/
+renv/staging/
+renv/python/
+
+*.tar.gz
+*.Rcheck/
