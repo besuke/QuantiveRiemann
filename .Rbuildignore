@@ -2,3 +2,5 @@
 ^renv\.lock$
 ^QuantiveRiemann\.Rproj$
 ^\.Rproj\.user$
+^\.positai$
+^\.claude$

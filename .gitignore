@@ -11,3 +11,4 @@ renv/python/
 
 *.tar.gz
 *.Rcheck/
+.positai
