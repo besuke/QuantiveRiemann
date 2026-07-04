@@ -538,18 +538,33 @@ qlr_bond_price_measures <- function(
     schedule = NULL
 ) {
   accrued_amount <- tryCatch(
-    bond$accruedAmount(),
-    error = function(e) NA_real_
+    QuantLibGauss::qlg_bond_accrued(bond),
+    error = function(e) tryCatch(bond$accruedAmount(), error = function(e) NA_real_)
   )
 
   clean_price <- tryCatch(
-    bond$cleanPrice(yield, day_counter, compounding, frequency),
-    error = function(e) NA_real_
+    QuantLibGauss::qlg_bond_price_from_yield(
+      bond = bond,
+      ytm = yield,
+      day_counter = day_counter,
+      compounding = compounding,
+      frequency = frequency
+    ),
+    error = function(e) tryCatch(
+      bond$cleanPrice(yield, day_counter, compounding, frequency),
+      error = function(e) NA_real_
+    )
   )
 
   dirty_price <- tryCatch(
     bond$dirtyPrice(yield, day_counter, compounding, frequency),
-    error = function(e) NA_real_
+    error = function(e) {
+      if (is.na(clean_price) || is.na(accrued_amount)) {
+        NA_real_
+      } else {
+        clean_price + accrued_amount
+      }
+    }
   )
 
   previous_coupon_date <- NULL
@@ -606,26 +621,65 @@ qlr_bond_risk_measures <- function(
     frequency
   )
 
-  macaulay_duration <- .qlr_bond_duration_call(
-    bond = bond,
-    interest_rate_obj = interest_rate_obj,
-    duration_type = .qlr_bond_duration_type_macaulay()
+  macaulay_duration <- tryCatch(
+    .qlr_bond_duration_call(
+      bond = bond,
+      interest_rate_obj = interest_rate_obj,
+      duration_type = .qlr_bond_duration_type_macaulay()
+    ),
+    error = function(e) NA_real_
   )
 
-  modified_duration <- .qlr_bond_duration_call(
-    bond = bond,
-    interest_rate_obj = interest_rate_obj,
-    duration_type = .qlr_bond_duration_type_modified()
+  modified_duration <- tryCatch(
+    QuantLibGauss::qlg_bond_duration(
+      bond = bond,
+      ytm = yield,
+      day_counter = day_counter,
+      compounding = compounding,
+      frequency = frequency
+    ),
+    error = function(e) tryCatch(
+      .qlr_bond_duration_call(
+        bond = bond,
+        interest_rate_obj = interest_rate_obj,
+        duration_type = .qlr_bond_duration_type_modified()
+      ),
+      error = function(e) NA_real_
+    )
   )
 
-  bpv <- .qlr_bond_bpv_call(
-    bond = bond,
-    interest_rate_obj = interest_rate_obj
+  bpv <- tryCatch(
+    QuantLibGauss::qlg_bond_pv01(
+      bond = bond,
+      ytm = yield,
+      day_counter = day_counter,
+      compounding = compounding,
+      frequency = frequency
+    ),
+    error = function(e) tryCatch(
+      .qlr_bond_bpv_call(
+        bond = bond,
+        interest_rate_obj = interest_rate_obj
+      ),
+      error = function(e) NA_real_
+    )
   )
 
-  convexity <- .qlr_bond_convexity_call(
-    bond = bond,
-    interest_rate_obj = interest_rate_obj
+  convexity <- tryCatch(
+    QuantLibGauss::qlg_bond_convexity(
+      bond = bond,
+      ytm = yield,
+      day_counter = day_counter,
+      compounding = compounding,
+      frequency = frequency
+    ),
+    error = function(e) tryCatch(
+      .qlr_bond_convexity_call(
+        bond = bond,
+        interest_rate_obj = interest_rate_obj
+      ),
+      error = function(e) NA_real_
+    )
   )
 
   tibble::tibble(
