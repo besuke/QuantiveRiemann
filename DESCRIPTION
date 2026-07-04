@@ -21,7 +21,8 @@ Imports:
     dplyr,
     purrr,
     tibble,
-    QuantLib
+    QuantLib,
+    QuantLibGauss
 Suggests:
     testthat (>= 3.0.0),
     devtools
