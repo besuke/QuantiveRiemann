@@ -1086,72 +1086,7 @@ qlr_bond_summary_table <- function(
 
   dplyr::bind_rows(price_table, risk_table)
 }
-.qlr_bond_duration_type_macaulay <- function() {
- out <- tryCatch(Duration_Macaulay, error = function(e) NULL)
-  if (!is.null(out)) {
-    return(out)
-  }
-  tryCatch(Duration$Macaulay, error = function(e) NULL)
-}
 
-.qlr_bond_duration_type_modified <- function() {
-  out <- tryCatch(Duration_Modified, error = function(e) NULL)
-  if (!is.null(out)) {
-    return(out)
-  }
-  tryCatch(Duration$Modified, error = function(e) NULL)
-}
-#' Bond risk measures from yield
-#' @export
-qlr_bond_risk_measures <- function(
-    bond,
-    yield,
-    day_counter,
-    compounding,
-    frequency
-) {
-  interest_rate_obj <- InterestRate(
-    yield,
-    day_counter,
-    compounding,
-    frequency
-  )
-
-  macaulay_duration <- tryCatch(
-    BondFunctions_duration(bond, interest_rate_obj, "Macaulay"),
-    error = function(e) NA_real_
-  )
-
-  modified_duration <- tryCatch(
-    BondFunctions_duration(bond, interest_rate_obj, "Modified"),
-    error = function(e) NA_real_
-  )
-
-  bpv <- tryCatch(
-    BondFunctions_basisPointValue(bond, interest_rate_obj),
-    error = function(e) NA_real_
-  )
-
-  convexity <- tryCatch(
-    BondFunctions_convexity(bond, interest_rate_obj),
-    error = function(e) NA_real_
-  )
-
-  tibble::tibble(
-    metric = c(
-      "macaulay_duration",
-      "modified_duration",
-      "bpv",
-      "convexity"
-    ),
-    value = c(
-      macaulay_duration,
-      modified_duration,
-      bpv,
-      convexity
-    )
-  )
-}
 
 #' Asset swap analysis for fixed-rate bond
 # ------------------------------------------------------------
